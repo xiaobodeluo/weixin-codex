@@ -1,0 +1,16 @@
+{
+  "name": "weixin-codex",
+  "version": "0.1.0",
+  "description": "把微信消息直接接到本机 Codex CLI 的桥接程序(iLink Bot 协议,复用 openclaw-weixin 登录凭证)",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node weixin-codex.mjs",
+    "test": "node --test",
+    "send-image": "node send-image.mjs",
+    "send-video": "node send-video.mjs"
+  }
+}

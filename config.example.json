@@ -1,0 +1,13 @@
+{
+  "accountId": "REPLACE_WITH_YOUR_ACCOUNT_ID",
+  "accountDir": "",
+  "stateDir": "",
+  "workspaceDir": "",
+  "waitMs": 600000,
+  "codexNode": "node",
+  "codexCli": "C:/path/to/node_modules/@openai/codex/bin/codex.js",
+  "visionBaseUrl": "https://api.deepseek.com",
+  "visionModel": "deepseek-v4-flash-vision-exp",
+  "visionModels": ["deepseek-v4-flash-vision-exp"],
+  "visionMaxTokens": 1024
+}

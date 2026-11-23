@@ -1,91 +1,93 @@
 # weixin-codex
 
-Bridge your WeChat messages straight into a local **Codex CLI** session: messages you send in WeChat go to a Codex session, and Codex's replies are sent back to WeChat.
+A self-hosted WeChat bridge for the local Codex CLI. WeChat talks to a persistent **manager** session while independent **worker** sessions perform the actual work, so chat remains responsive while jobs run.
 
-> Self-hosted, lightweight WeChat ⇄ AI bridge. It does **not** go through OpenClaw's agent runtime — it only reuses the login credentials produced by the `openclaw-weixin` plugin and talks to the WeChat iLink Bot backend directly (`getupdates` long-poll + `sendmessage`), using your local Codex CLI as the "brain".
+> [Chinese documentation](./README.md)
 
-> [中文文档](./README.md)
+## What changed in v0.2.0
 
-## Features
-
-- WeChat ⇄ Codex direct connection: same machine, same Codex config, same tools
-- Text messages, with a "typing…" indicator
-- **Images**: download+decrypt from the WeChat CDN → transcribe with a vision model → feed the transcript to Codex
-- **Codex can send media back**: one directive line in the reply sends a local image/video/file to WeChat
-- Message dedup and a persisted sync cursor (no loss, no replay after restart)
-- Self-healing: clear error messages on failure, and automatic rotation to a fresh thread when a resumed thread has grown too large (e.g. HTTP 413)
-- Zero third-party dependencies (Node built-ins only)
+- Persistent manager session for conversation, routing and summaries
+- Independent Codex worker for every dispatched task
+- Concurrent jobs (2 by default)
+- Non-blocking WeChat long poll
+- Periodic progress messages, cancellation and process-tree termination
+- Persisted job queue in `state/jobs.json`
+- Image transcription, optional Breeze TTS and outbound media directives
+- Structured manager decisions validated by a JSON schema
 
 ## Architecture
 
-```
+```text
 WeChat user
-   │  (1) send message
+   │
    ▼
-Tencent iLink Bot backend (ilinkai.weixin.qq.com)
-   │  (2) long-poll getupdates (with local login token)
-   ▼
-weixin-codex.mjs (this repo, long-running)
-   │  (3) spawn `codex exec …`
-   ▼
-Codex CLI session
-   │  (4) parse the --json event stream, extract the final reply text
+Tencent iLink Bot backend
+   │ getupdates long poll
    ▼
 weixin-codex.mjs
-   │  (5) sendmessage (with context_token)
-   ▼
-WeChat user receives the reply
+   ├── manager queue ──> persistent Codex manager
+   │                       │ reply / dispatch / cancel
+   │                       ▼
+   └───────────────────> worker queue
+                           ├── worker #1
+                           └── worker #2
+                                 │ job_finished
+                                 ▼
+                       manager summarizes to WeChat
 ```
 
 ## Prerequisites
 
-- **Node.js ≥ 22** (uses global `fetch`)
-- **Codex CLI** installed and logged in
-- **OpenClaw + the openclaw-weixin plugin**, scanned/logged in at least once (used only as a "login helper")
-- For image features: any OpenAI-compatible vision model (defaults to DeepSeek `deepseek-v4-flash-vision-exp`)
+- Node.js 22+
+- An installed and authenticated Codex CLI
+- OpenClaw plus `openclaw-weixin`, logged in once
+- Optional: an OpenAI-compatible vision model for image transcription
+- Optional: Breeze TTS and the bundled `vendor/silk-wasm`
 
 ## Quick start
 
 ```bash
-# 1. Install OpenClaw + WeChat plugin and scan the QR code
+# Login helper
 npm install -g openclaw
 npx -y @tencent-weixin/openclaw-weixin-cli@latest install
 
-# 2. Disable OpenClaw's own WeChat channel (important — avoids double replies)
+# Disable OpenClaw's own WeChat channel to avoid duplicate consumers
 openclaw config set plugins.entries.openclaw-weixin.enabled false
 openclaw gateway restart
 
-# 3. Clone, configure, run
-git clone <your-repo> weixin-codex
-cd weixin-codex
-cp config.example.json config.json   # set "accountId" and your Codex CLI path
+# Configure and run
+cp config.example.json config.json
 node weixin-codex.mjs
 ```
 
-See the [Chinese README](./README.md) for the full walkthrough (config reference, iLink protocol notes, two gotchas that will bite you, Windows/systemd autostart, troubleshooting).
+Set `accountId` and point `codexNode` / `codexCli` at the local Codex CLI. See the Chinese README for the complete configuration reference and setup details.
 
-## Sending media from Codex
+## Tests
 
-Put a directive on its own line in the reply:
-
+```bash
+npm test
 ```
+
+The tests cover media directive parsing and structured manager decisions.
+
+## Sending media
+
+Put a directive on its own line:
+
+```text
 [[send-image: C:\abs\path.png]]
 [[send-video: C:\abs\path.mp4]]
 [[send-file:  C:\abs\path.zip]]
 ```
 
-The bridge strips these lines, uploads each file to the WeChat CDN (AES-128-ECB), and sends it as a real media message; the remaining text is sent as the chat reply.
+The bridge strips the directive, uploads the local file to the WeChat CDN and sends it as a real media message.
 
 ## Security
 
-- Tokens in `~/.openclaw/openclaw-weixin/accounts/` are your bot's identity — **never commit them**. Rotate by re-scanning if leaked.
-- Codex runs with `--dangerously-bypass-approvals-and-sandbox`, so WeChat messages execute with your local privileges. Only use with accounts you fully trust.
-- See [SECURITY.md](./SECURITY.md).
+Never commit `config.json`, WeChat tokens, context tokens, API keys, logs or `state/`. Workers inherit the local Codex tool permissions and may modify this machine. Only connect a trusted WeChat account.
+
+This project uses an unofficial iLink Bot API and is not affiliated with Tencent, WeChat or OpenAI.
 
 ## License
 
 [MIT](./LICENSE)
-
-## Disclaimer
-
-Uses an unofficial, undocumented WeChat iLink Bot API that may change without notice. Not affiliated with Tencent/WeChat or OpenAI. Use at your own risk, on your own account only.

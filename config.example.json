@@ -4,10 +4,25 @@
   "stateDir": "",
   "workspaceDir": "",
   "waitMs": 600000,
+  "managerWaitMs": 120000,
+  "jobConcurrency": 2,
+  "jobProgressMs": 120000,
+  "codexRetryMs": 2000,
   "codexNode": "node",
-  "codexCli": "C:/path/to/node_modules/@openai/codex/bin/codex.js",
+  "codexCli": "",
   "visionBaseUrl": "https://api.deepseek.com",
   "visionModel": "deepseek-v4-flash-vision-exp",
   "visionModels": ["deepseek-v4-flash-vision-exp"],
-  "visionMaxTokens": 1024
+  "visionMaxTokens": 1024,
+  "visionTimeoutMs": 20000,
+  "visionAttempts": 2,
+  "breezeTts": {
+    "enabled": false,
+    "endpoint": "http://127.0.0.1:7860/v1/audio/speech",
+    "apiKey": "",
+    "timeoutMs": 120000,
+    "maxCharsPerMessage": 220,
+    "maxVoiceMessages": 3,
+    "alsoSendText": false
+  }
 }

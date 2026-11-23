@@ -3,8 +3,11 @@
 // Transport: WeChat iLink Bot backend (getupdates long-poll + sendmessage),
 // reusing the openclaw-weixin account credentials (same as dsh-weixin-direct).
 // Brain: the local Codex CLI (`codex exec`, same model/permissions as the
-// desktop app). Text goes straight to Codex; images are transcribed by the
-// DeepSeek multimodal (vision) model first, then the transcript is fed to Codex.
+// desktop app). A persistent manager session talks to WeChat and dispatches
+// work to independent worker sessions, so conversation does not block or
+// interrupt execution. Images are transcribed by the DeepSeek multimodal
+// (vision) model first, then the transcript is passed to the manager.
+// When Breeze TTS is enabled, short Codex replies are returned as WeChat voice.
 
 import fs from "node:fs";
 import os from "node:os";
@@ -13,7 +16,9 @@ import crypto from "node:crypto";
 import { createDecipheriv } from "node:crypto";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { sendBreezeVoiceReply } from "./breeze-voice.mjs";
 import { extractMediaDirectives } from "./directives.mjs";
+import { parseManagerDecision } from "./manager-protocol.mjs";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 
@@ -41,11 +46,33 @@ if (!ACCOUNT_ID) {
 
 const STATE_DIR = CFG.stateDir || path.join(SCRIPT_DIR, "state");
 const WORKSPACE_DIR = CFG.workspaceDir || SCRIPT_DIR;
-const WAIT_MS = Number.isFinite(CFG.waitMs) ? CFG.waitMs : 600000;
+const JOB_WAIT_MS = Number.isFinite(CFG.waitMs) ? CFG.waitMs : 600000;
+const MANAGER_WAIT_MS = Number.isFinite(CFG.managerWaitMs)
+  ? Math.max(30000, CFG.managerWaitMs)
+  : 120000;
+const JOB_CONCURRENCY = Number.isFinite(CFG.jobConcurrency)
+  ? Math.max(1, Math.min(4, CFG.jobConcurrency))
+  : 2;
+const JOB_PROGRESS_MS = Number.isFinite(CFG.jobProgressMs)
+  ? Math.max(30000, CFG.jobProgressMs)
+  : 120000;
+const BREEZE_TTS = CFG.breezeTts && typeof CFG.breezeTts === "object"
+  ? {
+      ...CFG.breezeTts,
+      channelVersion: CFG.breezeTts.channelVersion || "2.4.6",
+      botAgent: CFG.breezeTts.botAgent || "Codex/1.0",
+    }
+  : { enabled: false };
 
 const VISION_BASE = CFG.visionBaseUrl || "https://api.deepseek.com";
 const VISION_MODEL = CFG.visionModel || "deepseek-v4-flash-vision-exp";
 const VISION_MAX_TOKENS = Number.isFinite(CFG.visionMaxTokens) ? CFG.visionMaxTokens : 1024;
+const VISION_TIMEOUT_MS = Number.isFinite(CFG.visionTimeoutMs)
+  ? Math.max(5000, CFG.visionTimeoutMs)
+  : 20000;
+const VISION_ATTEMPTS = Number.isFinite(CFG.visionAttempts)
+  ? Math.min(5, Math.max(1, CFG.visionAttempts))
+  : 2;
 const VISION_MODELS =
   Array.isArray(CFG.visionModels) && CFG.visionModels.length
     ? CFG.visionModels
@@ -64,6 +91,9 @@ const VISION_API_KEY = loadVisionKey();
 
 const CODEX_NODE = CFG.codexNode || "node";
 const CODEX_CLI = CFG.codexCli || "";
+const CODEX_RETRY_MS = Number.isFinite(CFG.codexRetryMs)
+  ? Math.max(500, CFG.codexRetryMs)
+  : 2000;
 
 const ILINK_APP_ID = "bot";
 const CHANNEL_VERSION = "2.4.6";
@@ -79,10 +109,16 @@ const log = (level, ...args) =>
 
 fs.mkdirSync(STATE_DIR, { recursive: true });
 const seenFile = path.join(STATE_DIR, "seen-ids.json");
-const sessionFile = path.join(STATE_DIR, "codex-session.json");
-const replyFile = path.join(STATE_DIR, "reply.txt");
+const managerSessionFile = path.join(STATE_DIR, "codex-manager-session.json");
+const managerReplyFile = path.join(STATE_DIR, "manager-reply.txt");
+const jobsFile = path.join(STATE_DIR, "jobs.json");
+const managerSchemaFile = path.join(SCRIPT_DIR, "manager-response.schema.json");
 const imagesDir = path.join(STATE_DIR, "images");
+const voiceDir = path.join(STATE_DIR, "voice");
+const jobRepliesDir = path.join(STATE_DIR, "job-replies");
 fs.mkdirSync(imagesDir, { recursive: true });
+fs.mkdirSync(voiceDir, { recursive: true });
+fs.mkdirSync(jobRepliesDir, { recursive: true });
 
 const seenIds = new Set(
   fs.existsSync(seenFile) ? JSON.parse(fs.readFileSync(seenFile, "utf-8")) : [],
@@ -112,15 +148,16 @@ const contextTokens = fs.existsSync(tokensFile)
 const saveContextTokens = () =>
   fs.writeFileSync(tokensFile, JSON.stringify(contextTokens));
 
-let codexSessionId = "";
-if (fs.existsSync(sessionFile)) {
+let managerSessionId = "";
+if (fs.existsSync(managerSessionFile)) {
   try {
-    codexSessionId = JSON.parse(fs.readFileSync(sessionFile, "utf-8")).threadId || "";
+    managerSessionId =
+      JSON.parse(fs.readFileSync(managerSessionFile, "utf-8")).threadId || "";
   } catch {}
 }
-const saveCodexSession = (threadId) => {
-  codexSessionId = threadId;
-  fs.writeFileSync(sessionFile, JSON.stringify({ threadId }));
+const saveManagerSession = (threadId) => {
+  managerSessionId = threadId;
+  fs.writeFileSync(managerSessionFile, JSON.stringify({ threadId }));
 };
 
 // ------------------------------------------------------------------ weixin api
@@ -259,6 +296,7 @@ async function sendMedia(to, ctxToken, filePath, kind) {
         method: "POST",
         headers: { "Content-Type": "application/octet-stream" },
         body: new Uint8Array(ciphertext),
+        signal: AbortSignal.timeout(30000),
       });
       if (res.status !== 200) {
         const msg = res.headers.get("x-error-message") ?? (await res.text());
@@ -447,7 +485,7 @@ async function visionTranscribe(buffer, mediaType) {
   ];
   let lastErr;
   for (const model of VISION_MODELS) {
-    for (let attempt = 0; attempt < 5; attempt++) {
+    for (let attempt = 0; attempt < VISION_ATTEMPTS; attempt++) {
       const body = { model, messages, max_tokens: VISION_MAX_TOKENS };
       try {
         const res = await fetch(`${VISION_BASE}/chat/completions`, {
@@ -457,10 +495,13 @@ async function visionTranscribe(buffer, mediaType) {
             Authorization: `Bearer ${VISION_API_KEY}`,
           },
           body: JSON.stringify(body),
+          signal: AbortSignal.timeout(VISION_TIMEOUT_MS),
         });
         if (res.status === 429) {
           lastErr = new Error(`${model} 429`);
-          await new Promise((r) => setTimeout(r, 8000 + Math.floor(Math.random() * 2000)));
+          if (attempt + 1 < VISION_ATTEMPTS) {
+            await new Promise((r) => setTimeout(r, 3000 + Math.floor(Math.random() * 1000)));
+          }
           continue;
         }
         const raw = await res.text();
@@ -477,8 +518,12 @@ async function visionTranscribe(buffer, mediaType) {
         throw new Error(`${model} empty reply`);
       } catch (err) {
         lastErr = err;
-        if (String(err?.message).includes("429")) continue;
-        await new Promise((r) => setTimeout(r, 2000 * (attempt + 1)));
+        if (String(err?.message).includes("429")) {
+          continue;
+        }
+        if (attempt + 1 < VISION_ATTEMPTS) {
+          await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+        }
       }
     }
   }
@@ -486,23 +531,57 @@ async function visionTranscribe(buffer, mediaType) {
 }
 
 // ------------------------------------------------------------------- codex
-function codexArgs() {
-  const args = codexSessionId ? ["exec", "resume", codexSessionId] : ["exec", "-C", WORKSPACE_DIR];
-  args.push("--skip-git-repo-check");
-  args.push("--dangerously-bypass-approvals-and-sandbox");
-  // The desktop config registers a `notify` hook that pings the desktop app on
-  // every turn; silence it for WeChat turns to avoid notification spam.
-  args.push("-c", "notify=[]");
-  args.push("--json");
-  args.push("-o", replyFile);
-  args.push("-");
-  return args;
+function killChildTree(child) {
+  if (!child || child.killed) return;
+  if (process.platform === "win32" && child.pid) {
+    const killer = spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    killer.on("error", () => {
+      try {
+        child.kill();
+      } catch {}
+    });
+    return;
+  }
+  try {
+    child.kill("SIGTERM");
+  } catch {}
 }
 
-async function codexTurn(promptText) {
+function codexArgs({ sessionId = "", outputFile, manager = false }) {
+  const common = ["--skip-git-repo-check"];
+  if (manager) {
+    // The manager only talks and makes routing decisions. Keep it read-only so
+    // a routing mistake cannot turn the foreground conversation into a worker.
+    // `exec resume` does not expose --sandbox, so use the equivalent config key.
+    if (sessionId) common.push("-c", 'sandbox_mode="read-only"');
+    else common.push("--sandbox", "read-only");
+    common.push("--output-schema", managerSchemaFile);
+  } else {
+    common.push("--dangerously-bypass-approvals-and-sandbox");
+  }
+  // The desktop config registers a `notify` hook that pings the desktop app on
+  // every turn; silence it for WeChat turns to avoid notification spam.
+  common.push("-c", "notify=[]");
+  common.push("--json");
+  common.push("-o", outputFile);
+  if (sessionId) {
+    return ["exec", "resume", ...common, sessionId, "-"];
+  }
+  return ["exec", "-C", WORKSPACE_DIR, ...common, "-"];
+}
+
+async function codexTurn(promptText, options = {}) {
+  let sessionId = options.sessionId || "";
+  const manager = Boolean(options.manager);
+  const timeoutMs = options.timeoutMs || JOB_WAIT_MS;
+  const outputFile = options.outputFile || managerReplyFile;
+
   const runOnce = async () => {
-    if (fs.existsSync(replyFile)) fs.unlinkSync(replyFile);
-    const args = codexArgs();
+    if (fs.existsSync(outputFile)) fs.unlinkSync(outputFile);
+    const args = codexArgs({ sessionId, outputFile, manager });
     const env = { ...process.env };
     // These belong to the desktop-app thread that spawned us; strip them so the
     // child CLI manages its own session instead of targeting this one.
@@ -511,15 +590,18 @@ async function codexTurn(promptText) {
     delete env.CODEX_INTERNAL_ORIGINATOR_OVERRIDE;
 
     const child = spawn(CODEX_NODE, CODEX_CLI ? [CODEX_CLI, ...args] : args, {
-      stdio: ["pipe", "pipe", "ignore"],
+      stdio: ["pipe", "pipe", "pipe"],
       env,
       windowsHide: true,
     });
+    options.onChild?.(child);
 
     let lastAgentText = "";
     let newThreadId = "";
     let failed = false;
     let exitCode = null;
+    let eventError = "";
+    let stderrText = "";
     const handleLine = (line) => {
       const s = String(line).trim();
       if (!s.startsWith("{")) return;
@@ -531,7 +613,16 @@ async function codexTurn(promptText) {
         }
         // A hard failure (e.g. resume of an oversized thread -> HTTP 413) should
         // trigger a fresh-thread retry rather than silently returning no reply.
-        if (ev.type === "error" || ev.type === "turn.failed") failed = true;
+        if (ev.type === "error" || ev.type === "turn.failed") {
+          failed = true;
+          eventError =
+            ev.message ||
+            ev.error?.message ||
+            ev.error ||
+            ev.turn?.error?.message ||
+            ev.turn?.error ||
+            JSON.stringify(ev).slice(0, 1000);
+        }
       } catch {
         // non-JSON line from the CLI; ignore
       }
@@ -546,6 +637,9 @@ async function codexTurn(promptText) {
         stdoutBuf = stdoutBuf.slice(idx + 1);
       }
     });
+    child.stderr.on("data", (chunk) => {
+      stderrText = (stderrText + chunk.toString("utf8")).slice(-8000);
+    });
 
     child.stdin.write(promptText + "\n");
     child.stdin.end();
@@ -558,15 +652,21 @@ async function codexTurn(promptText) {
         resolve();
       };
       const timer = setTimeout(() => {
-        log("warn", "codex turn timed out, killing");
-        try {
-          child.kill();
-        } catch {}
+        log("warn", `${manager ? "manager" : "worker"} turn timed out, killing`);
+        killChildTree(child);
         // Give the killed child a short window to flush, then move on.
         setTimeout(finish, 15000);
-      }, WAIT_MS);
+      }, timeoutMs);
+      // `close` waits for inherited stdio pipes to close. A detached helper
+      // (for example a stuck plugin marketplace git check) can keep those
+      // handles open after Codex itself exits, so also settle on `exit`.
+      child.on("exit", (code) => {
+        exitCode = code ?? exitCode;
+        clearTimeout(timer);
+        setTimeout(finish, 250);
+      });
       child.on("close", (code) => {
-        exitCode = code;
+        exitCode = code ?? exitCode;
         clearTimeout(timer);
         finish();
       });
@@ -577,29 +677,433 @@ async function codexTurn(promptText) {
         finish();
       });
     });
+    options.onChild?.(null);
 
     if (stdoutBuf.trim()) handleLine(stdoutBuf);
 
     let text = lastAgentText;
-    if (!text && fs.existsSync(replyFile)) {
-      text = fs.readFileSync(replyFile, "utf-8").trim();
+    if (!text && fs.existsSync(outputFile)) {
+      text = fs.readFileSync(outputFile, "utf-8").trim();
     }
-    return { text, newThreadId, failed, exitCode };
+    const errorText = [eventError, stderrText.trim()].filter(Boolean).join("\n").trim();
+    if (!text && errorText) {
+      log("warn", `codex diagnostics: ${errorText.slice(-2500)}`);
+    }
+    return { text, newThreadId, failed, exitCode, errorText };
   };
 
   let res = await runOnce();
-  // If resuming a stale/oversized thread failed (no reply + error/exit), start
-  // a brand-new thread and retry the same prompt once.
-  if (!res.text && (res.failed || res.exitCode !== 0) && codexSessionId) {
-    log(
-      "warn",
-      "codex turn failed (previous thread may be too large), rotating to a fresh thread",
-    );
-    saveCodexSession("");
-    res = await runOnce();
+  if (options.shouldStop?.()) {
+    return { ...res, cancelled: true };
   }
-  if (res.newThreadId && !codexSessionId) saveCodexSession(res.newThreadId);
-  return res.text;
+  if (!res.text && (res.failed || res.exitCode !== 0)) {
+    const resumedThread = Boolean(sessionId);
+    const contextFailure =
+      /(?:status(?:\s+code)?\s*[:=]?\s*413|\b413\b|context[_ -]?length|maximum context|too many tokens|conversation[^\n]*too (?:large|long)|input[^\n]*too long)/i.test(
+        res.errorText,
+      );
+
+    // A transient model/network failure should not throw away a healthy
+    // conversation. Retry the same thread once before rotating.
+    if (resumedThread && !contextFailure) {
+      log("warn", "codex turn failed; retrying the existing thread once");
+      await new Promise((r) => setTimeout(r, CODEX_RETRY_MS));
+      if (options.shouldStop?.()) return { ...res, cancelled: true };
+      res = await runOnce();
+    }
+
+    // Rotate only for a context/history failure, or after the same-thread
+    // retry also failed. This preserves context across temporary API errors.
+    if (!res.text && (res.failed || res.exitCode !== 0) && sessionId) {
+      log("warn", "codex turn still failed; rotating to a fresh thread");
+      sessionId = "";
+      if (manager) saveManagerSession("");
+      await new Promise((r) => setTimeout(r, CODEX_RETRY_MS));
+      if (options.shouldStop?.()) return { ...res, cancelled: true };
+      res = await runOnce();
+    } else if (!res.text && (res.failed || res.exitCode !== 0) && !resumedThread) {
+      log("warn", "fresh codex turn failed; retrying once");
+      await new Promise((r) => setTimeout(r, CODEX_RETRY_MS));
+      if (options.shouldStop?.()) return { ...res, cancelled: true };
+      res = await runOnce();
+    }
+  }
+  if (res.newThreadId) options.onThread?.(res.newThreadId);
+  return res;
+}
+
+// ------------------------------------------------------- manager and jobs
+const JOB_ACTIVE = new Set(["queued", "running"]);
+const JOB_FINISHED = new Set(["succeeded", "failed", "cancelled"]);
+
+function loadJobs() {
+  if (!fs.existsSync(jobsFile)) return [];
+  try {
+    const parsed = JSON.parse(fs.readFileSync(jobsFile, "utf-8"));
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((job) => job && typeof job.id === "string").map((job) => {
+      if (JOB_ACTIVE.has(job.status)) {
+        return {
+          ...job,
+          status: "failed",
+          finishedAt: job.finishedAt || new Date().toISOString(),
+          error: "微信桥在处理期间重启，任务已中断。",
+        };
+      }
+      return job;
+    });
+  } catch (err) {
+    log("warn", "jobs.json parse failed", String(err));
+    return [];
+  }
+}
+
+const jobs = loadJobs();
+
+function saveJobs() {
+  const active = jobs.filter((job) => JOB_ACTIVE.has(job.status));
+  const finished = jobs
+    .filter((job) => JOB_FINISHED.has(job.status))
+    .sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)))
+    .slice(-40);
+  jobs.splice(0, jobs.length, ...active, ...finished);
+  fs.writeFileSync(jobsFile, JSON.stringify(jobs, null, 2));
+}
+saveJobs();
+
+function clip(text, max = 12000) {
+  const value = String(text || "");
+  return value.length <= max ? value : `${value.slice(0, max)}\n...(已截断)`;
+}
+
+function jobAge(job) {
+  const start = Date.parse(job.startedAt || job.createdAt || "");
+  if (!Number.isFinite(start)) return "未知";
+  const mins = Math.max(0, Math.floor((Date.now() - start) / 60000));
+  return mins < 1 ? "不到1分钟" : `${mins}分钟`;
+}
+
+function describeJobs() {
+  const active = jobs.filter((job) => JOB_ACTIVE.has(job.status));
+  const recent = jobs
+    .filter((job) => JOB_FINISHED.has(job.status))
+    .slice(-6)
+    .reverse();
+  const lines = [];
+  if (!active.length) {
+    lines.push("当前没有后台任务。");
+  } else {
+    lines.push("当前后台任务：");
+    for (const job of active) {
+      lines.push(
+        `- #${job.id} ${job.status === "running" ? "执行中" : "排队中"}，已${jobAge(job)}：${clip(job.task, 260)}`,
+      );
+    }
+  }
+  if (recent.length) {
+    lines.push("最近完成：");
+    for (const job of recent) {
+      const label =
+        job.status === "succeeded" ? "成功" : job.status === "cancelled" ? "已取消" : "失败";
+      lines.push(`- #${job.id} ${label}：${clip(job.task, 160)}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+function buildManagerPrompt(event) {
+  const common = [
+    "【系统角色：微信 Codex 主管】",
+    "你是用户微信里的常驻主管。你负责沟通、判断、拆解、派活、追踪和汇总；实际执行由独立后台工作进程完成。",
+    "你这一轮是只读的，不要亲自修改文件、运行实现命令、做调研或代替工作进程干活。",
+    "说话像一个可靠、简短、有判断的负责人，不要客服腔，不要长篇报告，不要假装任务已经完成。",
+    "",
+    "选择动作：",
+    "- reply：闲聊、解释、确认、状态查询等不需要实际执行的内容，直接回复。",
+    "- dispatch：需要实际查资料、读改文件、运行命令、写代码、操作软件或持续处理时，派给新的后台任务。task 必须自包含，写清目标、上下文和交付标准。reply 只做简短接单回复。",
+    "- cancel：用户明确要求停止某个正在运行或排队的任务时使用，并在 job_id 填任务编号。",
+    "",
+    "约束：",
+    "- 用户只是补充聊天、追问进度或修改方向时，不要卡住现有任务；需要新增实际工作时可另派任务。",
+    "- 用户没有明确取消时，绝不声称任务已停止。",
+    "- 处理 job_finished 事件时，根据真实结果向用户汇总；不要再次派发同一任务。",
+    "- 如果工作结果要求把本机媒体发到微信，原样保留独占一行的 [[send-image: 绝对路径]]、[[send-video: 绝对路径]] 或 [[send-file: 绝对路径]] 指令。",
+    "- 最终必须严格按输出 schema 返回 JSON；不使用的字符串字段填空字符串。",
+    "",
+    describeJobs(),
+  ];
+
+  if (event.kind === "job_finished") {
+    const job = event.job;
+    common.push(
+      "",
+      "【后台任务完成事件】",
+      `任务编号：#${job.id}`,
+      `状态：${job.status}`,
+      `原任务：${clip(job.task, 4000)}`,
+      `结果或错误：\n${clip(job.result || job.error || "(无文本结果)", 12000)}`,
+      "",
+      "请以主管身份向用户交付结果。保留关键事实、路径、验证结果和失败原因；没有证据不要补造。",
+    );
+  } else {
+    common.push(
+      "",
+      "【用户新消息】",
+      clip(event.message, 20000),
+      "",
+      "先判断这是聊天还是需要实际执行。需要执行就派工并立刻回复；不需要就正常对话。",
+    );
+  }
+  return common.join("\n");
+}
+
+async function managerTurn(event) {
+  const res = await codexTurn(buildManagerPrompt(event), {
+    manager: true,
+    sessionId: managerSessionId,
+    timeoutMs: MANAGER_WAIT_MS,
+    outputFile: managerReplyFile,
+    onThread: (threadId) => saveManagerSession(threadId),
+  });
+  if (res.cancelled) return null;
+  if (!res.text) {
+    throw new Error(res.errorText || "manager returned no text");
+  }
+  return parseManagerDecision(res.text);
+}
+
+let managerQueue = Promise.resolve();
+function enqueueManager(fn) {
+  const task = managerQueue.then(fn, fn);
+  managerQueue = task.catch(() => {});
+  return task;
+}
+
+async function deliverLeaderReply(from, reply, { voice = true } = {}) {
+  if (!reply) return;
+  const ctxToken = contextTokens[from] ?? "";
+  const { media, text: replyText } = extractMediaDirectives(reply);
+  let sentVoice = 0;
+  if (voice && replyText && BREEZE_TTS.enabled) {
+    try {
+      const voiceResult = await sendBreezeVoiceReply({
+        account,
+        to: from,
+        ctxToken,
+        replyText,
+        config: BREEZE_TTS,
+        outputDir: voiceDir,
+      });
+      sentVoice = voiceResult.sent;
+      if (voiceResult.skipped) {
+        log("info", `voice skipped reason=${voiceResult.skipped}`);
+      }
+      if (sentVoice) {
+        log("info", `voice replied to=${from} messages=${sentVoice}`);
+      }
+    } catch (err) {
+      log("error", "voice reply failed, falling back to text", String(err));
+    }
+  }
+  if (!sentVoice || BREEZE_TTS.alsoSendText) {
+    if (replyText) {
+      await sendReply(from, ctxToken, replyText);
+      log("info", `text replied to=${from} len=${replyText.length}`);
+    }
+  }
+  for (const item of media) {
+    try {
+      await sendMedia(from, ctxToken, item.path, item.kind);
+    } catch (err) {
+      log("error", `sendMedia failed (${item.kind} ${item.path})`, String(err));
+    }
+  }
+}
+
+const jobChildren = new Map();
+let runningJobCount = 0;
+
+function findJob(id) {
+  const wanted = String(id || "").replace(/^#/, "").trim();
+  if (!wanted) return null;
+  return jobs.find((job) => job.id === wanted || job.id.startsWith(wanted)) || null;
+}
+
+function cancelJob(id) {
+  const job = findJob(id);
+  if (!job || !JOB_ACTIVE.has(job.status)) return null;
+  job.status = "cancelled";
+  job.finishedAt = new Date().toISOString();
+  job.error = "用户取消";
+  saveJobs();
+  const child = jobChildren.get(job.id);
+  if (child) {
+    killChildTree(child);
+  }
+  log("info", `job cancelled id=${job.id}`);
+  return job;
+}
+
+function queueJob(task, from) {
+  const job = {
+    id: crypto.randomBytes(3).toString("hex"),
+    status: "queued",
+    task: String(task || "").trim(),
+    from,
+    createdAt: new Date().toISOString(),
+    startedAt: "",
+    finishedAt: "",
+    workerThreadId: "",
+    result: "",
+    error: "",
+  };
+  jobs.push(job);
+  saveJobs();
+  log("info", `job queued id=${job.id} from=${from} len=${job.task.length}`);
+  pumpJobQueue();
+  return job;
+}
+
+function workerPrompt(job) {
+  return [
+    "【后台工作指令】",
+    `任务编号：#${job.id}`,
+    `用户原始请求：${clip(job.task, 18000)}`,
+    "",
+    "你是独立工作进程。直接完成这项任务，不要把工作再派给别人，也不要扮演微信主管。",
+    "遵循工作区规则，实际检查文件/系统状态，修改后做必要验证。",
+    "最终回复只交付结果：完成了什么、关键证据或路径、验证结果；失败就明确失败点和已尝试的路径。",
+    "如果需要把本机文件发到微信，可在最终回复中加入独占一行的 [[send-image: 绝对路径]]、[[send-video: 绝对路径]] 或 [[send-file: 绝对路径]]。",
+  ].join("\n");
+}
+
+async function runJob(job) {
+  if (job.status !== "queued") return;
+  job.status = "running";
+  job.startedAt = new Date().toISOString();
+  saveJobs();
+  log("info", `job started id=${job.id}`);
+
+  const outputFile = path.join(jobRepliesDir, `${job.id}.txt`);
+  const heartbeat = setInterval(() => {
+    if (job.status !== "running") return;
+    sendMessage(
+      job.from,
+      contextTokens[job.from] ?? "",
+      `任务 #${job.id} 还在做，已经 ${jobAge(job)}。你继续吩咐，我这边不会打断它。`,
+    ).catch((err) => log("warn", `job progress send failed id=${job.id}`, String(err)));
+  }, JOB_PROGRESS_MS);
+  heartbeat.unref?.();
+
+  let shouldNotify = false;
+  try {
+    const res = await codexTurn(workerPrompt(job), {
+      manager: false,
+      sessionId: "",
+      timeoutMs: JOB_WAIT_MS,
+      outputFile,
+      onChild: (child) => {
+        if (child) jobChildren.set(job.id, child);
+        else jobChildren.delete(job.id);
+      },
+      onThread: (threadId) => {
+        job.workerThreadId = threadId;
+        saveJobs();
+      },
+      shouldStop: () => job.status === "cancelled",
+    });
+    if (job.status === "cancelled" || res.cancelled) return;
+    if (res.text) {
+      job.status = "succeeded";
+      job.result = clip(res.text, 30000);
+      shouldNotify = true;
+    } else {
+      job.status = "failed";
+      job.error = clip(res.errorText || `worker exited ${res.exitCode}`, 4000);
+      shouldNotify = true;
+    }
+  } catch (err) {
+    if (job.status !== "cancelled") {
+      job.status = "failed";
+      job.error = clip(String(err), 4000);
+      shouldNotify = true;
+    }
+  } finally {
+    clearInterval(heartbeat);
+    jobChildren.delete(job.id);
+    job.finishedAt = new Date().toISOString();
+    saveJobs();
+    runningJobCount = Math.max(0, runningJobCount - 1);
+    log("info", `job finished id=${job.id} status=${job.status}`);
+    pumpJobQueue();
+  }
+
+  if (shouldNotify) {
+    void notifyJobFinished(job).catch((err) => {
+      log("error", `job result notify failed id=${job.id}`, String(err));
+      const fallback =
+        job.status === "succeeded"
+          ? `任务 #${job.id} 做完了：\n${clip(job.result, 1600)}`
+          : `任务 #${job.id} 失败了：${clip(job.error, 800)}`;
+      sendMessage(job.from, contextTokens[job.from] ?? "", fallback).catch(() => {});
+    });
+  }
+}
+
+function pumpJobQueue() {
+  while (runningJobCount < JOB_CONCURRENCY) {
+    const job = jobs.find((item) => item.status === "queued");
+    if (!job) return;
+    runningJobCount += 1;
+    void runJob(job);
+  }
+}
+
+async function notifyJobFinished(job) {
+  await enqueueManager(async () => {
+    const decision = await managerTurn({ kind: "job_finished", job });
+    const fallback =
+      job.status === "succeeded"
+        ? `任务 #${job.id} 做完了：\n${clip(job.result, 6000)}`
+        : `任务 #${job.id} 失败了：${clip(job.error, 2000)}`;
+    const reply =
+      decision?.action === "reply" && decision.reply.trim()
+        ? decision.reply.trim()
+        : fallback;
+    await deliverLeaderReply(job.from, reply);
+  });
+}
+
+async function processUserMessage(from, prompt) {
+  try {
+    const decision = await enqueueManager(() =>
+      managerTurn({ kind: "user_message", message: prompt }),
+    );
+    let reply = decision?.reply?.trim() || "";
+
+    if (decision?.action === "dispatch") {
+      const job = queueJob(decision.task || prompt, from);
+      if (!reply) reply = `收到，我安排 #${job.id} 去处理。`;
+    } else if (decision?.action === "cancel") {
+      const cancelled = cancelJob(decision.jobId);
+      if (!reply) {
+        reply = cancelled
+          ? `好，#${cancelled.id} 已经停了。`
+          : "现在没有找到可停的任务。";
+      }
+    } else if (!reply) {
+      reply = "我在，你说。";
+    }
+
+    await deliverLeaderReply(from, reply);
+  } catch (err) {
+    log("error", "manager turn failed", String(err));
+    try {
+      await sendMessage(from, contextTokens[from] ?? "", "主管会话刚才没接上，你再说一遍。");
+    } catch {}
+  } finally {
+    await sendTyping(from, contextTokens[from] ?? "", 2);
+  }
 }
 
 // ----------------------------------------------------------------- handle
@@ -663,45 +1167,25 @@ async function handleMessage(msg) {
           transcripts.push("");
         }
       }
-      const gotTranscript = transcripts.some((t) => t && t.trim());
-      if (!gotTranscript) {
-        await sendMessage(from, ctxToken, "图片识别暂时被限流或失败,请稍后再发一次(图片已保存到本机)。");
-        return;
-      }
       const parts = [];
       if (text) parts.push(text);
       parts.push(
         `[图片视觉转录]\n${transcripts.map((t) => (t && t.trim()) ? t : "(识别失败)").join("\n---\n")}`,
       );
       parts.push(`[图片已保存到本机]\n${savedPaths.join("\n")}`);
+      parts.push("请直接查看上述本地图片文件；视觉转录仅作辅助，若转录为空或不完整，以图片本身为准。");
       prompt = parts.join("\n\n");
     }
 
-    const reply = await codexTurn(prompt);
-    const { media, text: replyText } = extractMediaDirectives(reply);
-    if (replyText) {
-      await sendReply(from, ctxToken, replyText);
-      log("info", `replied to=${from} len=${replyText.length}`);
-    }
-    for (const m of media) {
-      try {
-        await sendMedia(from, ctxToken, m.path, m.kind);
-      } catch (err) {
-        log("error", `sendMedia failed (${m.kind} ${m.path})`, String(err));
-      }
-      // Small gap so WeChat renders text then media in order.
-      await new Promise((r) => setTimeout(r, 500));
-    }
-    if (!replyText && media.length === 0) {
-      await sendMessage(from, ctxToken, "（Codex 处理完成,但没有文字回复;可能是超时,稍后再试）");
-      log("warn", `empty codex reply for from=${from}`);
-    }
+    // Hand the completed prompt to the foreground manager queue and return to
+    // polling immediately. The reply and any dispatched work happen in the
+    // background, so later WeChat messages can still reach the manager.
+    void processUserMessage(from, prompt);
   } catch (err) {
     log("error", "handleMessage failed", String(err));
     try {
       await sendMessage(from, ctxToken, "（桥接出错,稍后重试）");
     } catch {}
-  } finally {
     await sendTyping(from, ctxToken, 2);
   }
 }
@@ -715,6 +1199,9 @@ process.on("SIGINT", () => {
 });
 process.on("SIGTERM", async () => {
   running = false;
+  for (const child of jobChildren.values()) {
+    killChildTree(child);
+  }
   await notifyStop();
   process.exit(0);
 });
@@ -723,6 +1210,7 @@ async function main() {
   log("info", `starting, account=${ACCOUNT_ID} baseUrl=${baseUrl} userId=${userId}`);
   await notifyStart();
   let consecutiveErrors = 0;
+  let incomingQueue = Promise.resolve();
   while (running) {
     let resp;
     try {
@@ -751,11 +1239,9 @@ async function main() {
     const msgs = Array.isArray(resp.msgs) ? resp.msgs : [];
     if (msgs.length) log("info", `poll got ${msgs.length} msg(s)`);
     for (const msg of msgs) {
-      try {
-        await handleMessage(msg);
-      } catch (err) {
+      incomingQueue = incomingQueue.then(() => handleMessage(msg)).catch((err) => {
         log("error", "handleMessage failed", String(err));
-      }
+      });
     }
   }
 }

@@ -1,0 +1,20 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "action": {
+      "type": "string",
+      "enum": ["reply", "dispatch", "cancel"]
+    },
+    "reply": {
+      "type": "string"
+    },
+    "task": {
+      "type": "string"
+    },
+    "job_id": {
+      "type": "string"
+    }
+  },
+  "required": ["action", "reply", "task", "job_id"]
+}

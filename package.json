@@ -1,7 +1,7 @@
 {
   "name": "weixin-codex",
-  "version": "0.1.0",
-  "description": "把微信消息直接接到本机 Codex CLI 的桥接程序(iLink Bot 协议,复用 openclaw-weixin 登录凭证)",
+  "version": "0.2.0",
+  "description": "微信里的常驻 Codex 主管:主管负责沟通派活,独立 worker 执行任务",
   "type": "module",
   "license": "MIT",
   "engines": {

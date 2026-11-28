@@ -1,57 +1,42 @@
 # weixin-codex
 
-把微信接到本机 Codex CLI 的常驻桥接。微信里对话的是**主管**，实际执行交给独立 **worker**，所以任务运行期间仍然可以继续聊天、追问或改变方向。
+把微信接到本机 Codex 的常驻桥接。微信里的对话默认进入一个持续保留的
+Codex app-server 线程；任务运行中继续发消息，会作为 steering 接进当前
+工作，不再只能排队等待。
 
-> [English](./README.en.md)
+> 当前版本：`0.3.0`。英文说明见 [README.en.md](./README.en.md)。
 
-## 为什么是主管 + worker
+这是一个自托管工具，不是腾讯、微信或 OpenAI 的官方产品。它依赖未公开的
+微信 iLink Bot 接口，接口或登录方式可能随时变化。
 
-旧版每次微信消息都会直接进入同一个 Codex 会话。任务跑多久，桥就等多久；用户再发消息也只能排队，无法一边工作一边和它说话。
+## 新版能力
 
-`v0.2.0` 把通信和执行拆开:
+- **连续 app-server 会话**：默认使用 Codex app-server，保留线程并支持
+  `turn/steer`。任务跑着时仍可补充要求、纠正方向或追问。
+- **主管 / worker 降级路径**：app-server 不可用时，自动回落到主管会话
+  加独立 worker 的队列结构。
+- **任务不阻塞微信**：长轮询、主管决策和工作执行分离。
+- **文字、图片、文件和视频**：支持入站图片、主动发送图片/视频/文件。
+- **微信频道 CLI**：可从任意 Codex/终端会话列出联系人、轮询、发文字和媒体。
+- **可选视觉转录与语音回复**：OpenAI 兼容视觉接口；可选 Breeze TTS。
+- **可复现配置**：账号、路径和权限配置与源码分离；没有第三方运行时依赖。
+- **隐私清理**：日志只显示掩码用户 ID，不输出 token 或 context token。
 
-- **主管会话**常驻，只负责聊天、判断、拆任务、派活和汇总。
-- **工作会话**按任务独立启动，实际查资料、读写文件、运行命令或操作软件。
-- 微信长轮询不再被任务执行阻塞。
-- 默认最多并行 2 个 worker，可配置。
-- 任务运行期间每 2 分钟发送一次进度提示。
-- 完成、失败或取消后，worker 结果回到主管，由主管用微信口吻汇报。
-
-## 特性
-
-- 微信 iLink Bot 长轮询，收发文字消息
-- 主管/worker 分离，聊天不打断执行
-- 任务队列、并发控制、超时、取消和进程树终止
-- 任务结果持久化到 `state/jobs.json`
-- 图片下载、AES 解密、视觉转录后交给主管
-- 可主动向微信发送图片、视频和文件
-- 可选 Breeze TTS 语音回复
-- 会话过大或接口失败时自动重试、切换新会话
-- 无第三方运行时依赖，仅使用 Node 内置模块
-
-## 架构
+## 工作方式
 
 ```text
-微信用户
-   │
-   ▼
-腾讯 iLink Bot 后端
-   │ getupdates 长轮询
-   ▼
+微信
+  │  iLink Bot getupdates / sendmessage
+  ▼
 weixin-codex.mjs
-   ├── 主管队列 ──> Codex 主管会话
-   │                  │ dispatch / cancel / reply
-   │                  ▼
-   └──────────────> worker 队列
-                      ├── worker #1
-                      ├── worker #2
-                      └── ...
-                            │ job_finished
-                            ▼
-                       主管汇总后发回微信
+  ├── 默认：Codex app-server 持续线程
+  │      └── turn/steer 接入运行中的新消息
+  │
+  └── 降级：主管会话 ──> 独立 worker 队列
+                         └── 并发、超时、取消、结果回传
 ```
 
-主管使用受约束的 JSON 决策:
+主管模式的输出被限制为结构化动作：
 
 ```json
 {
@@ -62,25 +47,34 @@ weixin-codex.mjs
 }
 ```
 
-`action` 可选 `reply`、`dispatch`、`cancel`。结构定义在
+可选动作是 `reply`、`dispatch`、`cancel`。结构定义见
 [`manager-response.schema.json`](./manager-response.schema.json)。
 
 ## 前置条件
 
 - Node.js 22 或更高版本
 - 已安装并登录 Codex CLI
-- 已安装 OpenClaw 和 `openclaw-weixin`
-- 可选：OpenAI 兼容视觉模型，用于图片转录
-- 可选：Breeze TTS 服务和随仓库提供的 `vendor/silk-wasm`
+- 已安装 OpenClaw 和 `openclaw-weixin`，且完成一次微信扫码登录
+- 可选：OpenAI 兼容的视觉模型，用于图片转录
+- 可选：Breeze TTS 服务；语音编码所需的 `silk-wasm` 已随仓库提供
 
-## 1. 登录微信
+## 快速开始
+
+### 1. 获取项目
+
+```bash
+git clone https://github.com/xiaobodeluo/weixin-codex.git
+cd weixin-codex
+```
+
+### 2. 登录微信
 
 ```bash
 npm install -g openclaw
 npx -y @tencent-weixin/openclaw-weixin-cli@latest install
 ```
 
-扫码完成后，登录凭证位于:
+扫码后，登录凭证通常在：
 
 ```text
 ~/.openclaw/openclaw-weixin/accounts/
@@ -89,22 +83,33 @@ npx -y @tencent-weixin/openclaw-weixin-cli@latest install
 └── <ACCOUNT_ID>.context-tokens.json
 ```
 
-随后关闭 OpenClaw 自带的微信通道，避免两个客户端争抢消息:
+关闭 OpenClaw 自带的微信通道，避免两个客户端争抢消息：
 
 ```bash
 openclaw config set plugins.entries.openclaw-weixin.enabled false
 openclaw gateway restart
 ```
 
-## 2. 配置
+### 3. 创建配置
+
+PowerShell：
+
+```powershell
+Copy-Item config.example.json config.json
+```
+
+或 Unix shell：
 
 ```bash
 cp config.example.json config.json
 ```
 
-至少填写 `accountId`，并让 `codexNode` / `codexCli` 指向本机 Codex CLI。
+至少填写 `accountId`。`accountDir`、`stateDir` 和 `workspaceDir` 留空时会
+使用安全的本机默认值；相对路径以仓库目录为基准。
 
-原生可执行方式:
+Codex CLI 有两种常见配置。
+
+使用原生 `codex` 命令：
 
 ```json
 {
@@ -113,7 +118,7 @@ cp config.example.json config.json
 }
 ```
 
-npm 包装方式:
+使用 Node 包装的 Codex：
 
 ```json
 {
@@ -122,94 +127,154 @@ npm 包装方式:
 }
 ```
 
-主要配置:
+### 4. 检查环境
 
-| 键 | 默认值 | 说明 |
-|---|---:|---|
-| `accountId` | 必填 | OpenClaw 微信账号 ID |
-| `accountDir` | `~/.openclaw/openclaw-weixin/accounts` | 微信登录凭证目录 |
-| `stateDir` | `./state` | 本地运行状态 |
-| `workspaceDir` | 脚本所在目录 | worker 的 Codex 工作目录 |
-| `managerWaitMs` | `120000` | 主管单轮超时 |
-| `waitMs` | `600000` | worker 单任务超时 |
-| `jobConcurrency` | `2` | 并行 worker 数，范围 1–4 |
-| `jobProgressMs` | `120000` | 运行中进度提示间隔 |
-| `codexRetryMs` | `2000` | 失败重试间隔 |
-| `vision*` | 见示例 | 图片视觉转录配置 |
-| `breezeTts` | 关闭 | 可选语音回复配置 |
+```bash
+npm run doctor
+```
 
-不要把 `config.json`、`state/`、日志或登录凭证提交到仓库。`.gitignore` 已默认排除。
+`doctor` 会检查 Node、配置、微信账号文件、Codex CLI 和语音编码资源，
+不会打印 token。第一次尚未收到微信消息时，`context tokens` 可能显示
+`FAIL`；启动桥后给机器人发一条消息即可生成。
 
-## 3. 运行
+### 5. 启动
 
 ```bash
 npm start
 ```
 
-Windows 可以使用:
+Windows 可双击 [`run-client-hidden.vbs`](./run-client-hidden.vbs)。它会在
+隐藏窗口运行 `run-client.cmd`，日志写到仓库目录下的 `client.log` 和
+`client.err.log`。
 
-```text
-run-client-hidden.vbs
+## 配置项
+
+| 键 | 默认值 | 说明 |
+|---|---:|---|
+| `accountId` | 必填 | OpenClaw 微信账号 ID |
+| `accountDir` | `~/.openclaw/openclaw-weixin/accounts` | 微信登录凭证目录 |
+| `stateDir` | `./state` | 去重、任务、图片和语音等运行状态 |
+| `workspaceDir` | 仓库目录 | Codex 工作目录 |
+| `engine` | `app-server` | 主引擎；当前版本也保留 `manager` 降级 |
+| `agentEffort` | `high` | app-server 推理强度 |
+| `waitMs` | `600000` | 单次 worker 任务超时 |
+| `managerWaitMs` | `120000` | 主管单轮超时 |
+| `jobConcurrency` | `2` | worker 并发数，范围 1–4 |
+| `jobProgressMs` | `120000` | worker 进度提示间隔 |
+| `messageBatchMs` | `1500` | 连续文字合并等待时间 |
+| `imageBatchMs` | `5000` | 图片和补充文字合并等待时间 |
+| `mediaDedupeMs` | `900000` | 相同媒体重复发送抑制窗口 |
+| `codexRetryMs` | `2000` | Codex 失败重试间隔 |
+| `codexNode` | `codex` | Codex 可执行文件，或运行 JS 的 Node |
+| `codexCli` | 空 | 可选的 `codex.js` 路径 |
+| `vision*` | 见示例 | 图片转录接口、模型、超时和重试 |
+| `managerHistoryMessages` | `12` | 主管 API 保留的最近消息数 |
+| `managerApi` | 关闭 | manager 降级时的 OpenAI 兼容服务配置 |
+| `breezeTts` | 关闭 | 可选 Breeze TTS 配置 |
+
+环境变量可以覆盖关键路径：
+
+| 变量 | 作用 |
+|---|---|
+| `WEIXIN_CONFIG` | 指定 `config.json` 的绝对路径 |
+| `WEIXIN_ACCOUNT_ID` | 覆盖账号 ID |
+| `WEIXIN_ACCOUNT_DIR` | 覆盖微信凭证目录 |
+| `WEIXIN_STATE_DIR` | 覆盖运行状态目录 |
+| `WEIXIN_TO` | 发送工具默认微信联系人 ID |
+| `DEEPSEEK_API_KEY` | 图片视觉接口或 manager API 的密钥 |
+
+`config.json`、`state/`、日志和登录凭证已被 `.gitignore` 排除。不要强制
+提交这些文件。
+
+## 微信频道 CLI
+
+频道 CLI 与常驻桥共用 `config.json`、账号游标和 `state/`，适合由 Codex
+桌面会话或其他本地自动化驱动微信。
+
+```bash
+# 查看已有联系人
+node wechat-channel.mjs contacts
+
+# 长轮询最多 10 秒
+node wechat-channel.mjs poll --seconds 10
+
+# 发送文字
+node wechat-channel.mjs send --text "测试消息"
+
+# 指定联系人和媒体类型
+node wechat-channel.mjs send-media \
+  --to "<CONTACT_ID>" \
+  --path "C:/absolute/path/report.pdf" \
+  --kind file \
+  --caption "文件发你"
 ```
 
-它会通过 `run-client.cmd` 在隐藏窗口启动，并把日志写入 `client.log` 和 `client.err.log`。
+每个命令向 stdout 输出一个 JSON 对象。不要同时启动两个桥接或轮询进程
+消费同一个微信账号。
 
-## 4. 测试
+## 发送媒体
+
+Codex 最终回复可包含独占一行的媒体指令：
+
+```text
+[[send-image: C:\absolute\picture.png]]
+[[send-video: C:\absolute\clip.mp4]]
+[[send-file: C:\absolute\document.pdf]]
+```
+
+桥会删除指令行，把其余文字作为聊天消息发送，再把文件上传到微信 CDN。
+相同路径、大小和修改时间在去重窗口内只发送一次。
+
+也可以直接运行独立工具：
+
+```bash
+node send-text.mjs --to "<CONTACT_ID>" --text "hello"
+node send-image.mjs --to "<CONTACT_ID>" "C:/absolute/picture.png"
+node send-video.mjs --to "<CONTACT_ID>" "C:/absolute/clip.mp4"
+node send-video.mjs --to "<CONTACT_ID>" --as-file "C:/absolute/archive.zip"
+```
+
+省略 `--to` 时，优先使用 `WEIXIN_TO`、最近一次收到的联系人，最后才回退到
+账号自身的用户 ID。
+
+## 状态和恢复
+
+| 文件 | 用途 |
+|---|---|
+| `state/codex-app-thread.json` | app-server 持续线程 ID |
+| `state/codex-manager-session.json` | 主管会话 ID |
+| `state/jobs.json` | 降级模式的任务队列与最近结果 |
+| `state/job-replies/<id>.txt` | worker 最终输出 |
+| `state/seen-ids.json` | 微信消息去重 |
+| `state/images/` | 入站图片缓存 |
+| `state/voice/` | TTS 中间文件 |
+
+桥重启时，旧版本中仍在运行的任务会标记为中断，不会静默重复执行。
+
+## 测试
 
 ```bash
 npm test
 ```
 
-测试覆盖媒体指令解析和主管 JSON 决策解析。
+测试包含所有 `.mjs` 的语法检查、JSON 解析，以及媒体指令、主管决策和账号
+工具参数。
 
-实际联调时:
-
-1. 在微信里发一个闲聊问题，主管应直接回复。
-2. 发一个会运行较久的任务，主管应先接单。
-3. worker 运行时继续发消息，主管仍然可以回答。
-4. 任务结束后，主管应自动发送结果。
-
-## 主动发送媒体
-
-主管或 worker 的最终回复可以包含独占一行的指令:
-
-```text
-[[send-image: C:\绝对路径\图片.png]]
-[[send-video: C:\绝对路径\视频.mp4]]
-[[send-file:  C:\绝对路径\文件.zip]]
-```
-
-桥接会移除指令行，将剩余文字作为聊天消息发送，再把每个本地文件上传到微信 CDN 并作为真实媒体消息发出。
-
-## 状态文件
-
-| 文件 | 用途 |
-|---|---|
-| `state/codex-manager-session.json` | 常驻主管会话 ID |
-| `state/jobs.json` | 排队、运行、完成和失败任务 |
-| `state/job-replies/<id>.txt` | worker 最终输出 |
-| `state/seen-ids.json` | 微信消息去重 |
-| `state/images/` | 入站图片缓存 |
-| `state/voice/` | Breeze TTS 中间文件 |
-| `state/manager-reply.txt` | 主管最近一轮结构化回复 |
-
-桥重启时，旧的运行中任务会标记为中断，不会在无提示的情况下重新执行。
-
-## 取消和超时
-
-用户可以直接说“停掉 #任务号”。主管会返回 `cancel` 决策，桥接终止对应的 Codex 进程树。
-
-任务默认 10 分钟超时。主管单轮默认 2 分钟超时。超时不会卡住微信长轮询。
+CI 在 Node.js 22 和 24 上运行相同的测试。
 
 ## 安全边界
 
-- 微信账号 token、context token、API Key 和 `config.json` 不应进入 Git。
-- worker 默认使用 `--dangerously-bypass-approvals-and-sandbox`，会继承本机 Codex 的工具权限。只连接可信微信账号。
-- 主管使用只读 sandbox，但它仍能读取本机文件；主管提示要求它只做调度，不直接执行任务。
-- 这是非官方、未文档化的微信 iLink Bot 协议，接口可能变化。
+微信发来的消息实际上是一个远程执行入口。默认 app-server 和 worker 会以
+本机 Codex 的完整工具权限运行，可读写文件、运行命令和联网。
 
-详见 [SECURITY.md](./SECURITY.md)。
+- 只连接你完全信任的微信账号。
+- 把仓库放在专用目录或隔离环境中。
+- 不要公开 `config.json`、OpenClaw 账号文件、日志或 `state/`。
+- token 泄露后立即重新扫码登录并轮换凭证。
+- 如果只需要通信、不需要执行，请移除或收紧 app-server/worker 权限。
+
+更多说明见 [SECURITY.md](./SECURITY.md)。
 
 ## License
 
-[MIT](./LICENSE)
+[MIT](./LICENSE)。随仓库的 `vendor/silk-wasm` 使用其自身 MIT 许可证。

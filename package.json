@@ -1,7 +1,7 @@
 {
   "name": "weixin-codex",
-  "version": "0.2.0",
-  "description": "微信里的常驻 Codex 主管:主管负责沟通派活,独立 worker 执行任务",
+  "version": "0.3.0",
+  "description": "Responsive WeChat bridge for the local Codex app-server and CLI",
   "type": "module",
   "license": "MIT",
   "engines": {
@@ -9,7 +9,11 @@
   },
   "scripts": {
     "start": "node weixin-codex.mjs",
-    "test": "node --test",
+    "check": "node scripts/check.mjs",
+    "test": "npm run check && node --test",
+    "doctor": "node doctor.mjs",
+    "channel": "node wechat-channel.mjs",
+    "send-text": "node send-text.mjs",
     "send-image": "node send-image.mjs",
     "send-video": "node send-video.mjs"
   }

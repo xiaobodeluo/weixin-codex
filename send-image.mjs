@@ -4,49 +4,26 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
 import crypto from "node:crypto";
-import { fileURLToPath } from "node:url";
+import {
+  extractOption,
+  resolveWeixinAccount,
+} from "./weixin-account.mjs";
 
-const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
-const CFG = (() => {
-  try {
-    return JSON.parse(fs.readFileSync(path.join(SCRIPT_DIR, "config.json"), "utf-8"));
-  } catch {
-    return {};
-  }
-})();
-
-const ACCOUNT_DIR =
-  CFG.accountDir || path.join(os.homedir(), ".openclaw", "openclaw-weixin", "accounts");
-const ACCOUNT_ID = CFG.accountId || process.env.WEIXIN_ACCOUNT_ID || "";
-if (!ACCOUNT_ID) {
-  console.error("accountId is required (config.json accountId or WEIXIN_ACCOUNT_ID)");
-  process.exit(2);
-}
 const CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c";
 
-const accountFile = path.join(ACCOUNT_DIR, `${ACCOUNT_ID}.json`);
-const tokensFile = path.join(ACCOUNT_DIR, `${ACCOUNT_ID}.context-tokens.json`);
-
-const rawKey = process.argv.includes("--raw-key");
-const imagePath = process.argv
-  .slice(2)
-  .find((arg) => arg !== "--raw-key");
+const args = process.argv.slice(2);
+const toArg = extractOption(args, "to");
+const rawKey = args.includes("--raw-key");
+const imagePath = path.resolve(args.find((arg) => arg !== "--raw-key") || "");
 if (!imagePath || !fs.existsSync(imagePath)) {
-  console.error("usage: node send-image.mjs [--raw-key] <image path>");
+  console.error("usage: node send-image.mjs [--to <id>] [--raw-key] <image path>");
   process.exit(2);
 }
 
-const account = JSON.parse(fs.readFileSync(accountFile, "utf-8"));
-const contextTokens = fs.existsSync(tokensFile)
-  ? JSON.parse(fs.readFileSync(tokensFile, "utf-8"))
-  : {};
-
-const to = Object.keys(contextTokens)[0] || account.userId;
-const ctxToken = contextTokens[to] || "";
+const session = resolveWeixinAccount({ target: toArg });
+const { to, contextToken: ctxToken, account } = session;
 const { token, baseUrl } = account;
-const masked = token ? `${token.slice(0, 6)}...${token.slice(-4)}` : "NONE";
 
 const redact = (s) => String(s).replaceAll(token || "___", "***TOKEN***");
 
@@ -98,7 +75,7 @@ const aesEcbPaddedSize = (plainSize) =>
 async function main() {
   console.log(`image: ${imagePath}`);
   console.log(`to: ${to}`);
-  console.log(`token: ${masked}`);
+  console.log("token: configured");
 
   const plaintext = fs.readFileSync(imagePath);
   const rawsize = plaintext.length;

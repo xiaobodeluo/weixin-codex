@@ -17,13 +17,19 @@ import { createDecipheriv } from "node:crypto";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { sendBreezeVoiceReply } from "./breeze-voice.mjs";
+import { CodexAppServerClient } from "./codex-app-server.mjs";
 import { extractMediaDirectives } from "./directives.mjs";
+import { requestManagerDecision, resolveManagerApi } from "./manager-api.mjs";
 import { parseManagerDecision } from "./manager-protocol.mjs";
+import {
+  maskIdentifier,
+  resolveFromScript,
+} from "./weixin-account.mjs";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 
 function loadConfig() {
-  const file = path.join(SCRIPT_DIR, "config.json");
+  const file = process.env.WEIXIN_CONFIG || path.join(SCRIPT_DIR, "config.json");
   if (fs.existsSync(file)) {
     try {
       return JSON.parse(fs.readFileSync(file, "utf-8"));
@@ -35,17 +41,23 @@ function loadConfig() {
 }
 
 const CFG = loadConfig();
+const MANAGER_API = resolveManagerApi(CFG);
+const AGENT_ENGINE = String(CFG.engine || "app-server").toLowerCase();
+const AGENT_EFFORT = String(CFG.agentEffort || "high").toLowerCase();
 
 const ACCOUNT_DIR =
-  CFG.accountDir || path.join(os.homedir(), ".openclaw", "openclaw-weixin", "accounts");
-const ACCOUNT_ID = CFG.accountId || process.env.WEIXIN_ACCOUNT_ID || "";
+  resolveFromScript(process.env.WEIXIN_ACCOUNT_DIR || CFG.accountDir) ||
+  path.join(os.homedir(), ".openclaw", "openclaw-weixin", "accounts");
+const ACCOUNT_ID = process.env.WEIXIN_ACCOUNT_ID || CFG.accountId || "";
 if (!ACCOUNT_ID) {
   console.error("accountId is required (config.json accountId or WEIXIN_ACCOUNT_ID)");
   process.exit(2);
 }
 
-const STATE_DIR = CFG.stateDir || path.join(SCRIPT_DIR, "state");
-const WORKSPACE_DIR = CFG.workspaceDir || SCRIPT_DIR;
+const STATE_DIR =
+  resolveFromScript(process.env.WEIXIN_STATE_DIR || CFG.stateDir) ||
+  path.join(SCRIPT_DIR, "state");
+const WORKSPACE_DIR = resolveFromScript(CFG.workspaceDir) || SCRIPT_DIR;
 const JOB_WAIT_MS = Number.isFinite(CFG.waitMs) ? CFG.waitMs : 600000;
 const MANAGER_WAIT_MS = Number.isFinite(CFG.managerWaitMs)
   ? Math.max(30000, CFG.managerWaitMs)
@@ -56,6 +68,15 @@ const JOB_CONCURRENCY = Number.isFinite(CFG.jobConcurrency)
 const JOB_PROGRESS_MS = Number.isFinite(CFG.jobProgressMs)
   ? Math.max(30000, CFG.jobProgressMs)
   : 120000;
+const MESSAGE_BATCH_MS = Number.isFinite(CFG.messageBatchMs)
+  ? Math.max(500, CFG.messageBatchMs)
+  : 1500;
+const IMAGE_BATCH_MS = Number.isFinite(CFG.imageBatchMs)
+  ? Math.max(1000, CFG.imageBatchMs)
+  : 5000;
+const MEDIA_DEDUPE_MS = Number.isFinite(CFG.mediaDedupeMs)
+  ? Math.max(10000, CFG.mediaDedupeMs)
+  : 900000;
 const BREEZE_TTS = CFG.breezeTts && typeof CFG.breezeTts === "object"
   ? {
       ...CFG.breezeTts,
@@ -89,7 +110,7 @@ function loadVisionKey() {
 }
 const VISION_API_KEY = loadVisionKey();
 
-const CODEX_NODE = CFG.codexNode || "node";
+const CODEX_NODE = CFG.codexNode || "codex";
 const CODEX_CLI = CFG.codexCli || "";
 const CODEX_RETRY_MS = Number.isFinite(CFG.codexRetryMs)
   ? Math.max(500, CFG.codexRetryMs)
@@ -110,6 +131,8 @@ const log = (level, ...args) =>
 fs.mkdirSync(STATE_DIR, { recursive: true });
 const seenFile = path.join(STATE_DIR, "seen-ids.json");
 const managerSessionFile = path.join(STATE_DIR, "codex-manager-session.json");
+const managerHistoryFile = path.join(STATE_DIR, "manager-history.json");
+const appThreadFile = path.join(STATE_DIR, "codex-app-thread.json");
 const managerReplyFile = path.join(STATE_DIR, "manager-reply.txt");
 const jobsFile = path.join(STATE_DIR, "jobs.json");
 const managerSchemaFile = path.join(SCRIPT_DIR, "manager-response.schema.json");
@@ -119,6 +142,57 @@ const jobRepliesDir = path.join(STATE_DIR, "job-replies");
 fs.mkdirSync(imagesDir, { recursive: true });
 fs.mkdirSync(voiceDir, { recursive: true });
 fs.mkdirSync(jobRepliesDir, { recursive: true });
+
+let APP_CLIENT = null;
+let appLastFrom = "";
+
+async function handleAppFinal(result) {
+  const from = appLastFrom || userId;
+  if (!from) return;
+  const text =
+    result.text ||
+    (result.status === "failed"
+      ? `这次任务失败了：${String(result.error || "未知错误").slice(0, 1000)}`
+      : "");
+  if (!text) {
+    log("warn", `app-server turn produced no final text status=${result.status}`);
+  } else {
+    await deliverLeaderReply(from, text);
+  }
+  await sendTyping(from, contextTokens[from] ?? "", 2);
+}
+
+async function startAppServer() {
+  if (AGENT_ENGINE === "manager") return false;
+  try {
+    APP_CLIENT = new CodexAppServerClient({
+      node: CODEX_NODE,
+      cli: CODEX_CLI,
+      workspace: WORKSPACE_DIR,
+      threadFile: appThreadFile,
+      effort: AGENT_EFFORT,
+      baseInstructions: [
+        "你是用户微信里的连续 Codex 助手。",
+        "直接完成当前请求，用简短自然的中文回复。",
+        "用户在任务运行中发来的新消息应作为同一任务的 steering 立即吸收。",
+        "只有在确实有助于推进时才使用子智能体；不要为了形式拆分任务。",
+      ].join("\n"),
+      onFinal: handleAppFinal,
+      onProgress: (text) => log("info", `app progress len=${text.length}`),
+      onError: (text) => log("warn", "app-server", text),
+    });
+    const info = await APP_CLIENT.start();
+    log("info", `agent engine=app-server thread=${info.threadId} effort=${AGENT_EFFORT}`);
+    return true;
+  } catch (err) {
+    log("warn", "app-server unavailable, falling back to manager", String(err));
+    try {
+      APP_CLIENT?.stop();
+    } catch {}
+    APP_CLIENT = null;
+    return false;
+  }
+}
 
 const seenIds = new Set(
   fs.existsSync(seenFile) ? JSON.parse(fs.readFileSync(seenFile, "utf-8")) : [],
@@ -159,6 +233,32 @@ const saveManagerSession = (threadId) => {
   managerSessionId = threadId;
   fs.writeFileSync(managerSessionFile, JSON.stringify({ threadId }));
 };
+
+const MANAGER_HISTORY_LIMIT = Number.isFinite(CFG.managerHistoryMessages)
+  ? Math.max(4, Math.min(40, CFG.managerHistoryMessages))
+  : 12;
+function normalizeManagerHistory(items) {
+  return (Array.isArray(items) ? items : [])
+    .filter((item) => item && ["user", "assistant"].includes(item.role))
+    .map((item) => ({
+      role: item.role,
+      content: String(item.content || "").slice(0, 8000),
+    }))
+    .filter((item) => item.content)
+    .slice(-MANAGER_HISTORY_LIMIT);
+}
+let managerHistory = [];
+if (fs.existsSync(managerHistoryFile)) {
+  try {
+    managerHistory = normalizeManagerHistory(
+      JSON.parse(fs.readFileSync(managerHistoryFile, "utf-8")),
+    );
+  } catch {}
+}
+function saveManagerHistory(history) {
+  managerHistory = normalizeManagerHistory(history);
+  fs.writeFileSync(managerHistoryFile, JSON.stringify(managerHistory, null, 2));
+}
 
 // ------------------------------------------------------------------ weixin api
 function wechatUin() {
@@ -593,6 +693,7 @@ async function codexTurn(promptText, options = {}) {
       stdio: ["pipe", "pipe", "pipe"],
       env,
       windowsHide: true,
+      shell: process.platform === "win32" && !CODEX_CLI,
     });
     options.onChild?.(child);
 
@@ -806,6 +907,10 @@ function describeJobs() {
       const label =
         job.status === "succeeded" ? "成功" : job.status === "cancelled" ? "已取消" : "失败";
       lines.push(`- #${job.id} ${label}：${clip(job.task, 160)}`);
+      if (job.status === "succeeded" && job.result) {
+        const oneLineResult = String(job.result).replace(/\s+/g, " ").trim();
+        lines.push(`  结果摘要：${clip(oneLineResult, 600)}`);
+      }
     }
   }
   return lines.join("\n");
@@ -825,6 +930,8 @@ function buildManagerPrompt(event) {
     "",
     "约束：",
     "- 用户只是补充聊天、追问进度或修改方向时，不要卡住现有任务；需要新增实际工作时可另派任务。",
+    "- 如果已有运行中任务，或最近几分钟的任务结果已经满足当前请求，不要再派重复任务；直接回答、确认或引用已有结果。",
+    "- 用户围绕同一对象补发截图、文件名或短句时，先把它当作现有请求的补充证据，不要仅因附件形式变化就重复派单。",
     "- 用户没有明确取消时，绝不声称任务已停止。",
     "- 处理 job_finished 事件时，根据真实结果向用户汇总；不要再次派发同一任务。",
     "- 如果工作结果要求把本机媒体发到微信，原样保留独占一行的 [[send-image: 绝对路径]]、[[send-video: 绝对路径]] 或 [[send-file: 绝对路径]] 指令。",
@@ -858,7 +965,33 @@ function buildManagerPrompt(event) {
 }
 
 async function managerTurn(event) {
-  const res = await codexTurn(buildManagerPrompt(event), {
+  const prompt = buildManagerPrompt(event);
+  if (MANAGER_API.enabled) {
+    try {
+      const historyUserText =
+        event.kind === "job_finished"
+          ? `[后台任务 #${event.job.id} ${event.job.status}]\n${clip(
+              event.job.result || event.job.error || "",
+              4000,
+            )}`
+          : event.message;
+      const result = await requestManagerDecision({
+        provider: MANAGER_API,
+        prompt,
+        historyUserText,
+        history: managerHistory,
+      });
+      saveManagerHistory(result.history);
+      log(
+        "info",
+        `manager direct action=${result.decision.action} latency=${result.latencyMs}ms`,
+      );
+      return result.decision;
+    } catch (err) {
+      log("warn", "direct manager failed, falling back to Codex CLI", String(err));
+    }
+  }
+  const res = await codexTurn(prompt, {
     manager: true,
     sessionId: managerSessionId,
     timeoutMs: MANAGER_WAIT_MS,
@@ -877,6 +1010,56 @@ function enqueueManager(fn) {
   const task = managerQueue.then(fn, fn);
   managerQueue = task.catch(() => {});
   return task;
+}
+
+const pendingUserBatches = new Map();
+
+function enqueueUserPrompt(from, prompt) {
+  let batch = pendingUserBatches.get(from);
+  if (!batch) {
+    batch = { parts: [], timer: null, hasVisual: false };
+    pendingUserBatches.set(from, batch);
+  }
+  batch.parts.push(String(prompt || ""));
+  batch.hasVisual ||= batch.parts[batch.parts.length - 1].includes("[图片视觉转录]");
+  if (batch.timer) clearTimeout(batch.timer);
+
+  const delay = batch.hasVisual ? IMAGE_BATCH_MS : MESSAGE_BATCH_MS;
+  batch.timer = setTimeout(() => {
+    pendingUserBatches.delete(from);
+    const parts = batch.parts.filter(Boolean);
+    const combined =
+      parts.length <= 1
+        ? parts[0] || ""
+        : parts.map((part, index) => `[同一批连续消息 ${index + 1}]\n${part}`).join("\n\n");
+    if (!combined) return;
+    log("info", `manager batch from=${from} parts=${parts.length}`);
+    void processUserMessage(from, combined);
+  }, delay);
+  batch.timer.unref?.();
+}
+
+const sentMediaCache = new Map();
+
+function mediaDedupKey(filePath) {
+  try {
+    const resolved = fs.realpathSync(filePath);
+    const stat = fs.statSync(resolved);
+    return `${resolved}|${stat.size}|${Math.trunc(stat.mtimeMs)}`;
+  } catch {
+    return String(filePath || "");
+  }
+}
+
+function wasMediaRecentlySent(filePath) {
+  const key = mediaDedupKey(filePath);
+  const sentAt = sentMediaCache.get(key);
+  if (!sentAt) return false;
+  if (Date.now() - sentAt > MEDIA_DEDUPE_MS) {
+    sentMediaCache.delete(key);
+    return false;
+  }
+  return true;
 }
 
 async function deliverLeaderReply(from, reply, { voice = true } = {}) {
@@ -912,8 +1095,13 @@ async function deliverLeaderReply(from, reply, { voice = true } = {}) {
     }
   }
   for (const item of media) {
+    if (wasMediaRecentlySent(item.path)) {
+      log("info", `media duplicate suppressed kind=${item.kind} path=${item.path}`);
+      continue;
+    }
     try {
       await sendMedia(from, ctxToken, item.path, item.kind);
+      sentMediaCache.set(mediaDedupKey(item.path), Date.now());
     } catch (err) {
       log("error", `sendMedia failed (${item.kind} ${item.path})`, String(err));
     }
@@ -1127,7 +1315,7 @@ async function handleMessage(msg) {
   const hasVoice = (msg.item_list ?? []).some((i) => i?.type === 3);
   log(
     "info",
-    `msg from=${from} len=${text.length} images=${imageItems.length} mid=${mid} ctxTok=${msg.context_token ? String(msg.context_token).slice(0, 10) + "..." : "NONE"}`,
+    `msg from=${maskIdentifier(from)} len=${text.length} images=${imageItems.length} mid=${maskIdentifier(mid)} ctx=${msg.context_token ? "present" : "none"}`,
   );
 
   if (!text && imageItems.length === 0) {
@@ -1143,6 +1331,7 @@ async function handleMessage(msg) {
   await sendTyping(from, ctxToken, 1);
   try {
     let prompt = text;
+    let appImages = [];
     if (imageItems.length > 0) {
       const transcripts = [];
       const savedPaths = [];
@@ -1154,7 +1343,7 @@ async function handleMessage(msg) {
         const filePath = path.join(imagesDir, `${mid}-${i}.${ext}`);
         fs.writeFileSync(filePath, buffer);
         savedPaths.push(filePath);
-        if (VISION_API_KEY) {
+        if (VISION_API_KEY && !APP_CLIENT?.ready) {
           try {
             const r = await visionTranscribe(buffer, mediaType);
             log("info", `vision transcript len=${r.text.length} model=${r.model}`);
@@ -1167,20 +1356,39 @@ async function handleMessage(msg) {
           transcripts.push("");
         }
       }
+      appImages = savedPaths;
       const parts = [];
       if (text) parts.push(text);
-      parts.push(
-        `[图片视觉转录]\n${transcripts.map((t) => (t && t.trim()) ? t : "(识别失败)").join("\n---\n")}`,
-      );
+      if (!APP_CLIENT?.ready) {
+        parts.push(
+          `[图片视觉转录]\n${transcripts.map((t) => (t && t.trim()) ? t : "(识别失败)").join("\n---\n")}`,
+        );
+      }
       parts.push(`[图片已保存到本机]\n${savedPaths.join("\n")}`);
       parts.push("请直接查看上述本地图片文件；视觉转录仅作辅助，若转录为空或不完整，以图片本身为准。");
       prompt = parts.join("\n\n");
     }
 
-    // Hand the completed prompt to the foreground manager queue and return to
-    // polling immediately. The reply and any dispatched work happen in the
-    // background, so later WeChat messages can still reach the manager.
-    void processUserMessage(from, prompt);
+    if (APP_CLIENT?.ready) {
+      appLastFrom = from;
+      const inputs = [{ type: "text", text: prompt }];
+      for (const imagePath of appImages) {
+        inputs.push({ type: "localImage", path: imagePath });
+      }
+      const outcome = await APP_CLIENT.sendInput(inputs);
+      log("info", `app-server accepted mode=${outcome.mode} turn=${outcome.turnId || ""}`);
+      if (outcome.mode === "steered") {
+        await sendMessage(from, ctxToken, "收到，已经接进当前这件事。");
+      } else if (outcome.mode === "queued") {
+        await sendMessage(from, ctxToken, "收到，等当前步骤收尾后接着处理。");
+      }
+      return;
+    }
+
+    // Coalesce rapid text/image follow-ups from the same user before asking the
+    // manager to decide. This prevents one screenshot chain from being split
+    // into redundant jobs and replies.
+    enqueueUserPrompt(from, prompt);
   } catch (err) {
     log("error", "handleMessage failed", String(err));
     try {
@@ -1199,6 +1407,7 @@ process.on("SIGINT", () => {
 });
 process.on("SIGTERM", async () => {
   running = false;
+  APP_CLIENT?.stop();
   for (const child of jobChildren.values()) {
     killChildTree(child);
   }
@@ -1207,7 +1416,16 @@ process.on("SIGTERM", async () => {
 });
 
 async function main() {
-  log("info", `starting, account=${ACCOUNT_ID} baseUrl=${baseUrl} userId=${userId}`);
+  log("info", `starting workspace=${WORKSPACE_DIR} state=${STATE_DIR}`);
+  const appServerStarted = await startAppServer();
+  if (!appServerStarted) {
+    log(
+      "info",
+      MANAGER_API.enabled
+        ? `fallback manager provider=direct model=${MANAGER_API.model}`
+        : `fallback manager provider=codex-cli reason=${MANAGER_API.reason}`,
+    );
+  }
   await notifyStart();
   let consecutiveErrors = 0;
   let incomingQueue = Promise.resolve();

@@ -1,20 +1,45 @@
 # 安全说明
 
-## 凭证与密钥
+## 远程执行边界
 
-- `~/.openclaw/openclaw-weixin/accounts/` 里的 token 相当于你的微信机器人身份凭证。**绝不要提交到仓库**,泄露后请立即重新扫码登录轮换。
-- 本仓库源码**不包含**任何 token / API Key。所有凭证都在运行时从以下位置读取:
-  - 微信 token: `~/.openclaw/openclaw-weixin/accounts/<ACCOUNT_ID>.json`
-  - 视觉模型 key: 环境变量 `DEEPSEEK_API_KEY`,或 `~/.dsh/.credentials.yaml`
-  - Codex 自身的模型凭证: 由本机 Codex CLI 管理(如 `~/.codex/`)
-- `.gitignore` 已排除 `config.json`、`state/`、`outputs/`、日志与备份文件。
+微信消息会进入本机 Codex。默认 app-server 和 worker 使用完整工具权限，
+因此能读写文件、执行命令、访问网络和操作本机软件。请把微信账号视为一个
+远程执行入口。
 
-## 攻击面
+建议：
 
-- 本程序**只**监听微信(iLink)后端,对外不开放端口。
-- Codex CLI 以 `--dangerously-bypass-approvals-and-sandbox` 运行,即微信发来的指令会以你的本机权限执行。请仅在你完全信任的微信号/账号下使用,并优先在隔离环境或专用账号中运行。
-- 传入的消息会进入 Codex 会话,请像对待"远程执行入口"一样对待它。
+- 只连接你完全信任的微信账号。
+- 在专用目录、专用机器或隔离环境中运行。
+- 定期检查 `state/jobs.json`、任务输出和日志。
+- 不使用时停止桥接进程。
 
-## 上报问题
+## 凭证和敏感文件
 
-如果你发现安全问题,请不要公开提交 issue,先私下联系维护者。
+- 微信 token 位于 `~/.openclaw/openclaw-weixin/accounts/`，相当于机器人
+  身份凭证，泄露后应立即重新扫码登录。
+- 视觉或 manager API key 可来自环境变量 `DEEPSEEK_API_KEY` 或本机
+  `~/.dsh/.credentials.yaml`。
+- Codex 自己的模型凭证由本机 Codex 管理。
+- `.gitignore` 排除 `config.json`、`state/`、`outputs/`、`work/`、日志和
+  备份文件。
+- 发布 issue、截图或日志前，先删除账号 ID、联系人 ID、context token、
+  API key 和本机路径。
+
+源码不会打印 token，运行时日志会对账号和联系人 ID 做掩码。
+
+## 对外网络面
+
+桥接进程只主动调用微信 iLink Bot 后端、微信 CDN 和可选的视觉/TTS 服务。
+它不监听公网端口。微信频道 CLI 同样只发起出站请求。
+
+## 第三方协议
+
+项目使用未公开的微信 iLink Bot 协议，与腾讯或微信没有隶属或授权关系。
+协议变化可能导致登录、收消息或媒体发送失效。项目负责人不对账号限制、
+协议变更造成的数据丢失或服务中断作保证。
+
+## 报告问题
+
+发现安全问题时，请优先使用 GitHub 仓库的私密漏洞报告功能，或通过维护者
+的 GitHub 主页私下联系。不要在公开 issue 中粘贴 token、账号文件和运行
+日志。
